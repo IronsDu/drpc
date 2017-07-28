@@ -1,11 +1,14 @@
-# DRPC
+#include <iostream>
 
-DRPC是一个C++ 智能RPC库,开发者只需要通过简单的接口定义服务名称以及服务实现函数，调用者直接使用参数进行调用，无需考虑封包和解包。
+#include "RpcService.h"
+#include "JsonRpc.h"
+#include "MsgpackRpc.h"
 
-## 例子
+using namespace std;
+using namespace dodo::rpc;
 
-使用本地进程内进行模拟测试（可以很简单的通过网络库发送请求即可跨机器使用此RPC库）
-```
+int main()
+{
     RpcService<MsgpackProtocol> rpcServer;  // or RpcService<JsonProtocol> rpcServer
     RpcService<MsgpackProtocol> rpcClient;
 
@@ -49,4 +52,6 @@ DRPC是一个C++ 智能RPC库,开发者只需要通过简单的接口定义服�
         auto replyBinary = rpcServer.reply(reqID, "hello!");
         rpcClient.handleRpc(replyBinary);
     }
-```
+
+    return 0;
+}
