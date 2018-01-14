@@ -11,6 +11,7 @@
 
 #include "msgpack.hpp"
 #include "RpcCommon.h"
+#include "RpcMsgpackUtils.h"
 
 namespace google
 {
@@ -29,91 +30,6 @@ namespace dodo
 
         struct MsgpackProtocol
         {
-            template<class Tuple, std::size_t N>
-            struct TupleRead
-            {
-                static void read(const char* buffer, size_t size, size_t& off, Tuple& t)
-                {
-                    TupleRead<Tuple, N - 1>::read(buffer, size, off, t);
-                    ValueRead<std::is_base_of<::google::protobuf::Message, std::remove_reference<decltype(std::get<N - 1>(t))>::type>::value>::read(buffer, size, off, std::get<N - 1>(t));
-                }
-            };
-
-            template<class Tuple>
-            struct TupleRead < Tuple, 1 >
-            {
-                static void read(const char* buffer, size_t size, size_t& off, Tuple& t)
-                {
-                    ValueRead<std::is_base_of<::google::protobuf::Message, std::remove_reference<decltype(std::get<0>(t))>::type>::value>::read(buffer, size, off, std::get<0>(t));
-                }
-            };
-
-            template<bool isPB>
-            struct ValueRead
-            {
-                template<class... Args>
-                static  void    read(const char* buffer, size_t size, size_t& off, std::tuple<Args...>& value)
-                {
-                    TupleRead<decltype(value), sizeof...(Args)>::read(buffer, size, off, value);
-                }
-
-                template<typename T>
-                static  void    read(const char* buffer, size_t size, size_t& off, T& value)
-                {
-                    auto h = msgpack::unpack(buffer, size, off);
-                    const msgpack::object& o = h.get();
-                    value = o.as<T>();
-                }
-
-                template<typename T>
-                static void     read(const char* buffer, size_t size, size_t& off, std::vector<T>& value)
-                {
-                    int32_t len;
-                    read(buffer, size, off, len);
-                    while (off != size && len > 0)
-                    {
-                        T t;
-                        read(buffer, size, off, t);
-                        value.push_back(std::move(t));
-                        len--;
-                    }
-                }
-
-                template<typename K, typename T>
-                static void     read(const char* buffer, size_t size, size_t& off, std::map<K, T>& value)
-                {
-                    int32_t len;
-                    read(buffer, size, off, len);
-                    while (off != size && len > 0)
-                    {
-                        K key;
-                        read(buffer, size, off, key);
-                        T t;
-                        read(buffer, size, off, t);
-                        value.insert(std::make_pair(std::move(key), std::move(t)));
-                        len--;
-                    }
-                }
-
-            };
-
-            template<>
-            struct ValueRead<true>
-            {
-                template<typename T>
-                static  void    read(const char* buffer, size_t size, size_t& off, T& value)
-                {
-                    /*TODO::直接读取二进制流*/
-                    string str;
-                    msgpack::unpacked result;
-                    msgpack::unpack(result, buffer, size, off);
-                    const msgpack::object& o = result.get();
-                    o.convert(&str);
-                    value.ParseFromArray(str.c_str(), str.size());
-                }
-
-            };
-
             template<int SIZE, typename ...Args>
             struct Eval;
 
@@ -124,35 +40,31 @@ namespace dodo
                 struct Fuck
                 {
                     template<typename T, typename ...LeftArgs, typename ...NowArgs>
-                    static  void    eval(VariadicArgFunctor<Args...>* pThis, const char* buffer, size_t size, size_t& off, NowArgs&&... args)
+                    static  void    eval(const std::function<void(Args...)>& f,
+                        const char* buffer, 
+                        size_t size, 
+                        size_t& off, 
+                        NowArgs&&... args)
                     {
-                        typedef typename std::tuple_element<sizeof...(Args)-sizeof...(LeftArgs)-1, decltype(pThis->mTuple)>::type ARGTYPE;
-                        static_assert(std::is_same<std::remove_const<std::remove_reference<T>::type>::type, ARGTYPE>::value, "");
+                        typedef std::tuple_element<sizeof...(Args)-sizeof...(LeftArgs)-1,
+                            std::tuple<Args...>>::type TMP1;
 
-                        auto& value = std::get<sizeof...(Args)-sizeof...(LeftArgs)-1>(pThis->mTuple);
-                        clear(value);
+                        std::remove_const<std::remove_reference<TMP1>::type>::type value;
 
-                        ValueRead<std::is_base_of<::google::protobuf::Message, std::remove_reference<decltype(value)>::type>::value>::read(buffer, size, off, value);
+                        MsgpackUtils::ValueRead<std::is_base_of<::google::protobuf::Message,
+                            std::remove_reference<decltype(value)>::type>::value>::read(
+                                buffer, 
+                                size, 
+                                off,
+                                value);
 
-                        Eval<sizeof...(LeftArgs), Args...>::template eval<LeftArgs...>(pThis, buffer, size, off, args..., value);
-                    }
-                };
-            };
-
-            template<>
-            struct HelpEval < RpcRequestInfo >
-            {
-                template<typename ...Args>
-                struct Fuck
-                {
-                    template<typename T, typename ...LeftArgs, typename ...NowArgs>
-                    static  void    eval(VariadicArgFunctor<Args...>* pThis, const char* buffer, size_t size, size_t& off, NowArgs&&... args)
-                    {
-                        static_assert(std::is_same<std::remove_const<std::remove_reference<T>::type>::type, RpcRequestInfo>::value, "");
-
-                        RpcRequestInfo value;
-                        value.setRequestID(pThis->getRequestID());
-                        Eval<sizeof...(LeftArgs), Args...>::template eval<LeftArgs...>(pThis, buffer, size, off, args..., value);
+                        Eval<sizeof...(LeftArgs), Args...>::template eval<LeftArgs...>(
+                            f, 
+                            buffer, 
+                            size, 
+                            off, 
+                            std::forward<NowArgs>(args)...,
+                            value);
                     }
                 };
             };
@@ -161,11 +73,17 @@ namespace dodo
             struct Eval
             {
                 template<typename ...LeftArgs, typename ...NowArgs>
-                static  void    eval(VariadicArgFunctor<Args...>* pThis, const char* buffer, size_t size, size_t& off, NowArgs&&... args)
+                static  void    eval(const std::function<void(Args...)>& f,
+                    const char* buffer, 
+                    size_t size, 
+                    size_t& off, 
+                    NowArgs&&... args)
                 {
-                    typedef HelpEval<typename std::tuple_element<sizeof...(Args)-sizeof...(LeftArgs), decltype(pThis->mTuple)>::type> TMP1;
-                    typedef typename TMP1::template Fuck<Args...> TMP;
-                    TMP::template eval<LeftArgs...>(pThis, buffer, size, off, args...);
+                    typedef std::tuple<Args...> TUPLE_TYPE;
+                    typedef std::tuple_element<sizeof...(Args)-sizeof...(LeftArgs), TUPLE_TYPE>::type TMP1;
+                    typedef HelpEval<TMP1> TMP2;
+                    typedef typename TMP2::template Fuck<Args...> TMP;
+                    TMP::template eval<LeftArgs...>(f, buffer, size, off, std::forward<NowArgs>(args)...);
                 }
             };
 
@@ -173,9 +91,13 @@ namespace dodo
             struct Eval < 0, Args... >
             {
                 template<typename ...NowArgs>
-                static  void    eval(VariadicArgFunctor<Args...>* pThis, const char* buffer, size_t size, size_t& off, NowArgs&&... args)
+                static  void    eval(const std::function<void(Args...)>& f, 
+                    const char* buffer, 
+                    size_t size, 
+                    size_t& off, 
+                    NowArgs&&... args)
                 {
-                    (pThis->mf)(args...);
+                    f(std::forward<NowArgs>(args)...);
                 }
             };
 
@@ -185,148 +107,46 @@ namespace dodo
                 struct Invoke
                 {
                 public:
-                    static void invoke(int id, void* pvoid, const char* buffer, size_t len, size_t& off)
+                    static void invoke(const std::function<void(Args...)>& f, const char* buffer, size_t len, size_t& off)
                     {
-                        auto pThis = (VariadicArgFunctor<Args...>*)pvoid;
-                        pThis->setRequestID(id);
-                        Eval<sizeof...(Args), Args...>::template eval<Args...>(pThis, buffer, len, off);
+                        Eval<sizeof...(Args), Args...>::template eval<Args...>(f, buffer, len, off);
                     }
                 };
             };
 
-            class FunctionMgr : public BaseFunctorMgr < decltype(&Decode::Invoke<void>::invoke), Decode >
+            template<typename T>
+            static void lowExecute(const std::string& msg, const T& lambdaObj)
             {
-            public:
-                void    execute(const char* str, size_t size)
-                {
-                    try
-                    {
-                        string name;
-                        std::size_t off = 0;
+                _lowExecute(msg, lambdaObj, &T::operator());
+            }
 
-                        {
-                            auto h = unpack(str, size, off, MSGPACK_NULLPTR);
-                            const msgpack::object& o = h.get();
-                            auto req_id = o.as<int>();
-                            setRequestID(req_id);
-                        }
-
-                {
-                    auto h = unpack(str, size, off, MSGPACK_NULLPTR);
-                    const msgpack::object& o = h.get();
-                    name = o.as<string>();
-                }
-
-                auto it = mWrapFunctions.find(name);
-                assert(it != mWrapFunctions.end());
-                if (it != mWrapFunctions.end())
-                {
-                    ((*it).second)(getRequestID(), mRealFunctionPtr[name], str, size, off);
-                }
-                    }
-                    catch (msgpack::type_error)
-                    {
-                        cout << "parse error" << endl;
-                    }
-                    catch (...)
-                    {
-                        cout << "parse error" << endl;
-                    }
-                }
-            };
-
-            template<class Tuple, std::size_t N>
-            struct TupleWrite
+            template<typename LAMBDA_OBJ_TYPE, typename ...Args>
+            static void _lowExecute(const std::string& msg,
+                const LAMBDA_OBJ_TYPE& lambdaObj,
+                void(LAMBDA_OBJ_TYPE::*func)(Args...) const)
             {
-                static void write(msgpack::sbuffer& sbuf, const Tuple& value)
-                {
-                    TupleWrite<Tuple, N - 1>::write(sbuf, value);
-                    ValueWrite<std::is_base_of<::google::protobuf::Message, decltype(std::get<N - 1>(value))>::value>::write(sbuf, std::get<N - 1>(value));
-                }
-            };
+                size_t size = msg.size();
+                std::size_t off = 0;
+                Decode::Invoke<Args...>::invoke(lambdaObj, msg.c_str(), size, off);
+            }
 
-            template<class Tuple>
-            struct TupleWrite < Tuple, 1 >
+            template<typename LAMBDA>
+            static SERVICE_WRAPPER makeWrapper(const LAMBDA& lambdaObj)
             {
-                static void write(msgpack::sbuffer& sbuf, const Tuple& value)
-                {
-                    ValueWrite<std::is_base_of<::google::protobuf::Message, decltype(std::get<0>(value))>::value>::write(sbuf, std::get<0>(value));
-                }
-            };
-
-            template<bool isPB>
-            struct ValueWrite
-            {
-                template<typename T>
-                static  void    write(msgpack::sbuffer& sbuf, const T& value)
-                {
-                    msgpack::pack(&sbuf, value);
-                }
-
-                template<class... Args>
-                static  void    write(msgpack::sbuffer& sbuf, const std::tuple<Args...>& value)
-                {
-                    TupleWrite<decltype(value), sizeof...(Args)>::write(sbuf, value);
-                }
-
-                template<typename T>
-                static  void    write(msgpack::sbuffer& sbuf, const vector<T>& value)
-                {
-                    write(sbuf, (int32_t)value.size());
-                    for (auto& v : value)
-                    {
-                        write(sbuf, v);
-                    }
-                }
-
-                template<typename K, typename T>
-                static  void    write(msgpack::sbuffer& sbuf, const map<K, T>& value)
-                {
-                    write(sbuf, (int32_t)value.size());
-                    for (auto& v : value)
-                    {
-                        write(sbuf, v.first);
-                        write(sbuf, v.second);
-                    }
-                }
-            };
-
-            template<>
-            struct ValueWrite<true>
-            {
-                template<typename T>
-                static  void    write(msgpack::sbuffer& sbuf, const T& value)
-                {
-                    char stackBuf[1024];
-                    int pbByteSize = value.ByteSize();
-                    if (pbByteSize <= sizeof(stackBuf))
-                    {
-                        value.SerializeToArray(stackBuf, pbByteSize);
-
-                        msgpack::packer<msgpack::sbuffer>(sbuf).pack_str(pbByteSize);
-                        msgpack::packer<msgpack::sbuffer>(sbuf).pack_str_body(stackBuf, pbByteSize);
-                    }
-                    else
-                    {
-                        string str;
-                        str.resize(pbByteSize);
-                        value.SerializeToArray((void*)str.c_str(), pbByteSize);
-
-                        msgpack::packer<msgpack::sbuffer>(sbuf).pack_str(str.size());
-                        msgpack::packer<msgpack::sbuffer>(sbuf).pack_str_body(str.c_str(), str.size());
-                    }
-                }
-            };
+                return [lambdaObj](const std::string& str) {
+                    lowExecute(str, lambdaObj);
+                };
+            }
 
             template<bool>
             struct SelectWriteArgMsgpack
             {
-                template<typename ARGTYPE>
-                static  void    Write(BaseCaller& caller, FunctionMgr& functionMgr, msgpack::sbuffer& sbuf, msgpack::sbuffer& lambdabuf, const ARGTYPE& arg)
+                template<typename LAMBDA>
+                static  SERVICE_WRAPPER    Write(
+                    msgpack::sbuffer& sbuf,
+                    const LAMBDA& lambdaObj)
                 {
-                    int id = caller.makeNextID();
-                    functionMgr.insertFunction(std::to_string(id), arg);
-                    msgpack::pack(&lambdabuf, id);
+                    return makeWrapper(lambdaObj);
                 }
             };
 
@@ -334,45 +154,53 @@ namespace dodo
             struct SelectWriteArgMsgpack < false >
             {
                 template<typename ARGTYPE>
-                static  void    Write(BaseCaller& caller, FunctionMgr& functionMgr, msgpack::sbuffer& sbuf, msgpack::sbuffer& lambdabuf, const ARGTYPE& arg)
+                static  SERVICE_WRAPPER Write(
+                    msgpack::sbuffer& sbuf, 
+                    const ARGTYPE& arg)
                 {
-                    msgpack::pack(&lambdabuf, -1);
-                    ValueWrite<std::is_base_of<::google::protobuf::Message, ARGTYPE>::value>::write(sbuf, arg);
+                    MsgpackUtils::ValueWrite<std::is_base_of<::google::protobuf::Message, ARGTYPE>::value>::write(sbuf, arg);
+                    return nullptr;
                 }
             };
 
-            class Caller : public BaseCaller
+            class Caller
             {
             public:
                 template<typename... Args>
-                string    call(FunctionMgr& msgpackFunctionResponseMgr, const char* funname, const Args&... args)
+                CALL_RESULT call(const Args&... args)
                 {
-                    msgpack::sbuffer lambdabuf;
                     msgpack::sbuffer sbuf;
-                    msgpack::pack(&sbuf, funname);
 
-                    writeCallArg(msgpackFunctionResponseMgr, sbuf, lambdabuf, args...);
+                    auto f = writeCallArg(sbuf, args...);
 
-                    return string(lambdabuf.data(), lambdabuf.size()) + string(sbuf.data(), sbuf.size());
+                    return std::make_tuple(string(sbuf.data(), sbuf.size()), f);
                 }
             private:
                 template<typename Arg>
-                void    writeCallArg(FunctionMgr& msgpackFunctionResponseMgr, msgpack::sbuffer& sbuf, msgpack::sbuffer& lambdabuf, const Arg& arg)
+                SERVICE_WRAPPER writeCallArg(
+                    msgpack::sbuffer& sbuf,
+                    const Arg& arg)
                 {
                     /*只(剩)有一个参数,肯定也为最后一个参数，允许为lambda*/
-                    SelectWriteArgMsgpack<std::is_function<Arg>::value || HasCallOperator<Arg>::value>::Write(*this, msgpackFunctionResponseMgr, sbuf, lambdabuf, arg);
+                    return SelectWriteArgMsgpack<std::is_function<Arg>::value || 
+                        HasCallOperator<Arg>::value>::Write(
+                            sbuf, 
+                            arg);
                 }
 
                 template<typename Arg1, typename... Args>
-                void    writeCallArg(FunctionMgr& msgpackFunctionResponseMgr, msgpack::sbuffer& sbuf, msgpack::sbuffer& lambdabuf, const Arg1& arg1, const Args&... args)
+                SERVICE_WRAPPER writeCallArg(
+                    msgpack::sbuffer& sbuf, 
+                    const Arg1& arg1, 
+                    const Args&... args)
                 {
-                    ValueWrite<std::is_base_of<::google::protobuf::Message, Arg1>::value>::write(sbuf, arg1);
-                    writeCallArg(msgpackFunctionResponseMgr, sbuf, lambdabuf, args...);
+                    MsgpackUtils::ValueWrite<std::is_base_of<::google::protobuf::Message, Arg1>::value>::write(sbuf, arg1);
+                    return writeCallArg(sbuf,  args...);
                 }
 
-                void    writeCallArg(FunctionMgr& msgpackFunctionResponseMgr, msgpack::sbuffer& sbuf, msgpack::sbuffer& lambdabuf)
+                SERVICE_WRAPPER writeCallArg(msgpack::sbuffer& sbuf)
                 {
-                    msgpack::pack(&lambdabuf, -1);
+                    return nullptr;
                 }
             };
         };
